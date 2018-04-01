@@ -169,14 +169,14 @@ def get_output_filename(game, station, resolution):
             game["gameDate"]
         ).astimezone(pytz.timezone("US/Eastern"))
 
-        game_date = start_time.date().strftime("%Y%m%d")
-        game_time = start_time.time().strftime("%H%M")
-        return "mlb.%s.%s@%s.%s.%s.ts" \
+        game_date = start_time.date().strftime("%Y-%m-%d")
+        game_time = start_time.time().strftime("%I%M%p")
+        return "%s.%s.vs.%s.%s-%s-mlb.ts" \
                % (game_date,
                   game["teams"]["away"]["team"]["fileCode"],
                   game["teams"]["home"]["team"]["fileCode"],
-                  game_time,
-                  station.lower()
+                  game_time.lower(),
+                  station
                   )
     except KeyError:
         return "mlb.%d.%s.ts" % (game["gamePk"], resolution)
