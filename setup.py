@@ -8,7 +8,7 @@ from glob import glob
 
 name = "mlbstreamer"
 setup(name=name,
-      version="0.0.3.dev0",
+      version="0.0.9.dev0",
       description="MLB.tv Stream Browser",
       author="Tony Cebzanov",
       author_email="tonycpsu@gmail.com",
@@ -18,11 +18,9 @@ setup(name=name,
           "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
           "Intended Audience :: End Users/Desktop"
       ],
+      license = "GPLv2",
       packages=find_packages(),
-      data_files=[
-          ("share/doc/%s" % name,
-           ["LICENSE","README.md"]),
-      ],
+      include_package_data=True,
       install_requires = [
           "six",
           "requests",
@@ -33,20 +31,13 @@ setup(name=name,
           "orderedattrdict",
           "pyyaml",
           "py-dateutil",
-          "streamlink",
-          "prompt_toolkit"
+          "streamlink>=0.11.0",
+          "prompt_toolkit",
+          "urwid",
+          "urwid_utils>=0.1.2",
+          "panwid>=0.2.3"
       ],
-      extras_require={
-          'gui':  [
-              "urwid",
-              "urwid_utils==0.1.1.dev0",
-              "panwid==0.2.2.dev5",
-          ],
-      },
-      dependency_links=[
-          "https://github.com/tonycpsu/urwid_utils/tarball/master#egg=urwid_utils-0.0.5a",
-          "https://github.com/tonycpsu/panwid/tarball/master#egg=panwid-0.2.1",
-      ],
+      test_suite="test",
       entry_points = {
           "console_scripts": [
               "mlbstreamer=mlbstreamer.__main__:main",

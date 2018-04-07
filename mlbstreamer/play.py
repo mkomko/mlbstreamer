@@ -8,6 +8,7 @@ import subprocess
 import argparse
 from datetime import datetime, timedelta
 import pytz
+import shlex
 
 import dateutil.parser
 from orderedattrdict import AttrDict
@@ -54,11 +55,13 @@ def play_stream(game_specifier, resolution,
                 season=season
             )
         )
-        teams = AttrDict(
-            (team["fileCode"], team["id"])
-            for team in sorted(state.session.get(teams_url).json()["teams"],
-                               key=lambda t: t["fileCode"])
-        )
+
+        with state.session.cache_responses_long():
+            teams = AttrDict(
+                (team["fileCode"], team["id"])
+                for team in sorted(state.session.get(teams_url).json()["teams"],
+                                   key=lambda t: t["fileCode"])
+            )
 
         if team not in teams:
             msg = "'%s' not a valid team code, must be one of:\n%s" %(
@@ -130,10 +133,10 @@ def play_stream(game_specifier, resolution,
         resolution,
     ]
     if config.settings.streamlink_args:
-	    cmd +=config.settings.streamlink_args.split(' ')
+        cmd += shlex.split(config.settings.streamlink_args)
+
     if offset:
         cmd += ["--hls-start-offset", offset]
-    logger.debug(" ".join(cmd))
 
     if output is not None:
         if output == True or os.path.isdir(output):
@@ -149,7 +152,7 @@ def play_stream(game_specifier, resolution,
 
         cmd += ["-o", outfile]
 
-    logger.debug(cmd)
+    logger.debug("Running cmd: %s" % " ".join(cmd))
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
     return proc
 
@@ -209,6 +212,8 @@ def main():
                         default="720p")
     parser.add_argument("-s", "--save-stream", help="save stream to file",
                         nargs="?", const=True)
+    parser.add_argument("--no-cache", help="do not use response cache",
+                        action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="verbose logging")
     parser.add_argument("--init-config", help="initialize configuration",
@@ -218,6 +223,7 @@ def main():
                         help="team abbreviation or MLB game ID")
     options, args = parser.parse_known_args()
 
+    global logger
     logger = logging.getLogger("mlbstreamer")
     if options.verbose:
         logger.setLevel(logging.DEBUG)
@@ -237,7 +243,7 @@ def main():
     if not options.game:
         parser.error("option game")
 
-    state.session = MLBSession.new()
+    state.session = MLBSession.new(no_cache=options.no_cache)
 
     preferred_stream = None
     date = None

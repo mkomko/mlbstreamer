@@ -1,0 +1,21 @@
+language: python
+install:
+- pip install
+script:
+- python setup.py test
+matrix:
+  include:
+  - stage: test
+    python: 2.7
+  - stage: test
+    python: 3.5
+  - stage: test
+    python: 3.6
+  - stage: deploy
+    deploy:
+      provider: pypi
+      user: tonycpsu
+      password:
+        secure: gPp7im9NUW9YWcX+5DaVXwFQZAGY6IRrszAfYW8atC9BeyZw5Mwm6mXFLLbUuqx2flnUn9GXBYkk8Ae2d5ivPTsst+rtJp7Zov9gPz1jgrXPR/2JWmP2NIAWL7050+RknTxbCpJo9ZfMz7DkW2jNfEB8knXF6Zon3gejmAPRD6B5M2f8eXcQH2Qt+qx1aT7Dk8bq7JAC8JDhTiFJoKOtMAhQ0iVRh1eykxnCNMZ5z3WpzbkaBa6ePFmK5hbNdfrtUpepW4+p0Ntu1yfTzYnZnForkfjdZYOFo4Ehc7g+wAyqRl05ZUUYo8Zp8b39A0yahHHMtF6W4+x/wPPEsBlzQVMEXQ/Z0SLZGGLMgcKfEivg+lV4gK4pzLVI3Hibfxi6FswqaGGSyGmT/lfnTM5IvKLPRlilylpTV8zVp/jpiDSzMpVMkmvOd3Mfcx/KJWwWklR7ye9npGjiSX67rgCj7rJs0Nrr4IU0fPPCncT5s/WN0+doE2PVGed4xLHV1ZNhUTL1c89RDXZHPmhc+BzNVaHXkfd9mTIobnzouompqLX0OCh3B2GYT7AC8dxHfJrveBOk7Fgws1mbcbopbYA9VCZfbpq0UmZ2iTQEK5ke3nMbn2RtHldClIQHsX5A6C9BEoURtOJCDyoGsIIZqLURtA4CTiyfMIkF6gm5AekCNE8=
+      on:
+        tags: true
