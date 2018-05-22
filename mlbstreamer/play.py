@@ -15,6 +15,7 @@ from orderedattrdict import AttrDict
 
 from . import config
 from . import state
+from .util import *
 from .session import *
 
 class MLBPlayException(Exception):
@@ -23,11 +24,13 @@ class MLBPlayException(Exception):
 class MLBPlayInvalidArgumentError(MLBPlayException):
     pass
 
-def play_stream(game_specifier, resolution,
+def play_stream(game_specifier, resolution=None,
                 offset=None,
+                media_id = None,
                 preferred_stream=None,
+                call_letters=None,
                 output=None,
-                date_json=None):
+                verbose=0):
 
     live = False
     team = None
@@ -35,6 +38,11 @@ def play_stream(game_specifier, resolution,
     sport_code = "mlb" # default sport is MLB
 
     media_title = "MLBTV"
+    media_id = None
+    allow_stdout=False
+
+    if resolution is None:
+        resolution = "best"
 
     if isinstance(game_specifier, int):
         game_id = game_specifier
@@ -93,6 +101,7 @@ def play_stream(game_specifier, resolution,
             team_id = teams[team]
         )
 
+
     try:
         date = schedule["dates"][-1]
         game = date["games"][game_number-1]
@@ -102,20 +111,30 @@ def play_stream(game_specifier, resolution,
             game_number, team, game_date)
         )
 
-    preferred_stream = (
-        "AWAY"
-        if team == game["teams"]["away"]["team"]["abbreviation"].lower()
-        else "HOME"
+    logger.info("playing game %d at %s" %(
+        game_id, resolution)
     )
 
+    if not preferred_stream or call_letters:
+        preferred_stream = (
+            "away"
+            if team == game["teams"]["away"]["team"]["abbreviation"].lower()
+            else "home"
+        )
+
     try:
-        media = next(state.session.get_media(game_id,
-                                             title=media_title,
-                                             preferred_stream=preferred_stream))
+        media = next(state.session.get_media(
+            game_id,
+            media_id = media_id,
+            title=media_title,
+            preferred_stream=preferred_stream,
+            call_letters = call_letters
+        ))
     except StopIteration:
         raise MLBPlayException("no matching media for game %d" %(game_id))
 
     media_id = media["mediaId"] if "mediaId" in media else media["guid"]
+
     media_state = media["mediaState"]
 
     if "playbacks" in media:
@@ -129,7 +148,10 @@ def play_stream(game_specifier, resolution,
         except TypeError:
             raise MLBPlayException("no stream URL for game %d" %(game_id))
 
-    if (offset is not None):
+    offset_timestamp = None
+    offset_seconds = None
+
+    if (offset is not False and offset is not None):
 
         timestamps = state.session.media_timestamps(game_id, media_id)
 
@@ -144,15 +166,17 @@ def play_stream(game_specifier, resolution,
             # calculate HLS offset, which is negative from end of stream
             # for live streams
             start_time = dateutil.parser.parse(timestamps["S"])
-            offset = str(
+            offset_delta = (
                 datetime.now(pytz.utc)
-                - (start_time.astimezone(pytz.utc))
+                - start_time.astimezone(pytz.utc)
                 + (timedelta(seconds=-offset))
             )
         else:
             logger.debug("recorded stream")
-            offset = str(timedelta(seconds=offset))
+            offset_delta = timedelta(seconds=offset)
 
+        offset_seconds = offset_delta.seconds
+        offset_timestamp = str(offset_delta)
         logger.info("starting at time offset %s" %(offset))
 
     cmd = [
@@ -167,15 +191,26 @@ def play_stream(game_specifier, resolution,
     if config.settings.streamlink_args:
         cmd += shlex.split(config.settings.streamlink_args)
 
-    if offset:
-        cmd += ["--hls-start-offset", offset]
+    if offset_timestamp:
+        cmd += ["--hls-start-offset", offset_timestamp]
+
+    if verbose > 1:
+
+        allow_stdout=True
+        cmd += ["-l", "debug"]
+
+        if verbose > 2:
+            if not output:
+                cmd += ["-v"]
+            cmd += ["--ffmpeg-verbose"]
 
     if output is not None:
         if output == True or os.path.isdir(output):
             outfile = get_output_filename(
                 game,
                 media["callLetters"],
-                resolution
+                resolution,
+                offset=str(offset_seconds)
             )
             if os.path.isdir(output):
                 outfile = os.path.join(output, outfile)
@@ -185,15 +220,11 @@ def play_stream(game_specifier, resolution,
         cmd += ["-o", outfile]
 
     logger.debug("Running cmd: %s" % " ".join(cmd))
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    proc = subprocess.Popen(cmd, stdout=None if allow_stdout else open(os.devnull, 'w'))
     return proc
 
-# def get_date_json(game_id, date_json):
-#     if date_json is not None:
-#         return date_json
-#     return state.session.schedule(game_id=game_id)["dates"][-1]
 
-def get_output_filename(game, station, resolution):
+def get_output_filename(game, station, resolution, offset=None):
     try:
         # if (date is None):
         #     date = state.session.schedule(game_id=game["gamePk"])["dates"][-1]
@@ -215,14 +246,6 @@ def get_output_filename(game, station, resolution):
                   )
     except KeyError:
         return "mlb.%d.%s.ts" % (game["gamePk"], resolution)
-
-
-def valid_date(s):
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except ValueError:
-        msg = "Not a valid date: '{0}'.".format(s)
-        raise argparse.ArgumentTypeError(msg)
 
 
 def begin_arg_to_offset(value):
@@ -257,6 +280,15 @@ def main():
 
     today = datetime.now(pytz.timezone('US/Eastern')).date()
 
+    init_parser = argparse.ArgumentParser()
+    init_parser.add_argument("--init-config", help="initialize configuration",
+                        action="store_true")
+    options, args = init_parser.parse_known_args()
+    if options.init_config:
+        config.settings.init_config()
+        sys.exit(0)
+    config.settings.load()
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--date", help="game date",
                         type=valid_date,
@@ -271,15 +303,13 @@ def main():
                         type=begin_arg_to_offset,
                         const=0)
     parser.add_argument("-r", "--resolution", help="stream resolution",
-                        default="720p")
+                        default=config.settings.default_resolution)
     parser.add_argument("-s", "--save-stream", help="save stream to file",
                         nargs="?", const=True)
     parser.add_argument("--no-cache", help="do not use response cache",
                         action="store_true")
-    parser.add_argument("-v", "--verbose", action="store_true",
+    parser.add_argument("-v", "--verbose", action="count",
                         help="verbose logging")
-    parser.add_argument("--init-config", help="initialize configuration",
-                        action="store_true")
     parser.add_argument("game", metavar="game",
                         nargs="?",
                         help="team abbreviation or MLB game ID")
@@ -296,11 +326,6 @@ def main():
         logger.addHandler(handler)
     else:
         logger.addHandler(logging.NullHandler())
-
-    if options.init_config:
-        config.settings.init_config()
-        sys.exit(0)
-    config.settings.load()
 
     if not options.game:
         parser.error("option game")
@@ -322,6 +347,7 @@ def main():
             offset = options.begin,
             preferred_stream = preferred_stream,
             output = options.save_stream,
+            verbose = options.verbose
         )
         proc.wait()
     except MLBPlayInvalidArgumentError as e:
