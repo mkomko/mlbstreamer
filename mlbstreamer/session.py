@@ -8,13 +8,15 @@ import json
 import sqlite3
 import pickle
 import functools
+import random
+import string
 from contextlib import contextmanager
 
 import six
-from six.moves.http_cookiejar import LWPCookieJar
+from six.moves.http_cookiejar import LWPCookieJar, Cookie
 from six import StringIO
 import requests
-# from requests_toolbelt.utils import dump
+from requests_toolbelt.utils import dump
 import lxml
 import lxml, lxml.etree
 import yaml
@@ -28,46 +30,10 @@ import dateutil.parser
 from . import config
 from . import state
 from .state import memo
+from .exceptions import *
 
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.12; rv:56.0) "
               "Gecko/20100101 Firefox/56.0.4")
-PLATFORM = "macintosh"
-
-BAM_SDK_VERSION="3.0"
-
-API_KEY_URL= "https://www.mlb.com/tv/g490865/"
-API_KEY_RE = re.compile(r'"apiKey":"([^"]+)"')
-CLIENT_API_KEY_RE = re.compile(r'"clientApiKey":"([^"]+)"')
-
-TOKEN_URL_TEMPLATE = (
-    "https://media-entitlement.mlb.com/jwt"
-    "?ipid={ipid}&fingerprint={fingerprint}==&os={platform}&appname=mlbtv_web"
-)
-
-GAME_CONTENT_URL_TEMPLATE="http://statsapi.mlb.com/api/v1/game/{game_id}/content"
-
-# GAME_FEED_URL = "http://statsapi.mlb.com/api/v1/game/{game_id}/feed/live"
-
-SCHEDULE_TEMPLATE=(
-    "http://statsapi.mlb.com/api/v1/schedule"
-    "?sportId={sport_id}&startDate={start}&endDate={end}"
-    "&gameType={game_type}&gamePk={game_id}"
-    "&teamId={team_id}"
-    "&hydrate=linescore,team,game(content(summary,media(epg)),tickets)"
-)
-
-ACCESS_TOKEN_URL = "https://edge.bamgrid.com/token"
-
-STREAM_URL_TEMPLATE="https://edge.svcs.mlb.com/media/{media_id}/scenarios/browser"
-
-AIRINGS_URL_TEMPLATE=(
-    "https://search-api-mlbtv.mlb.com/svc/search/v2/graphql/persisted/query/"
-    "core/Airings?variables={{%22partnerProgramIds%22%3A[%22{game_id}%22]}}"
-)
-
-SESSION_FILE=os.path.join(config.CONFIG_DIR, "session")
-COOKIE_FILE=os.path.join(config.CONFIG_DIR, "cookies")
-CACHE_FILE=os.path.join(config.CONFIG_DIR, "cache.sqlite")
 
 # Default cache duration to 60 seconds
 CACHE_DURATION_SHORT = 60 # 60 seconds
@@ -75,10 +41,33 @@ CACHE_DURATION_MEDIUM = 60*60*24 # 1 day
 CACHE_DURATION_LONG = 60*60*24*30  # 30 days
 CACHE_DURATION_DEFAULT = CACHE_DURATION_SHORT
 
-class MLBSessionException(Exception):
+CACHE_FILE=os.path.join(config.CONFIG_DIR, "cache.sqlite")
+
+def gen_random_string(n):
+    return ''.join(
+        random.choice(
+            string.ascii_uppercase + string.digits
+        ) for _ in range(64)
+    )
+
+
+class Media(AttrDict):
     pass
 
-class MLBSession(object):
+
+class Stream(AttrDict):
+    pass
+
+class StreamSession(object):
+    """
+    Top-level stream session interface
+
+    Individual stream providers can be implemented by inheriting from this class
+    and implementing methods for login flow, getting streams, etc.
+    """
+
+
+    # SESSION_FILE=os.path.join(config.CONFIG_DIR, "session")
 
     HEADERS = {
         "User-agent": USER_AGENT
@@ -87,28 +76,21 @@ class MLBSession(object):
     def __init__(
             self,
             username, password,
-            api_key=None,
-            client_api_key=None,
-            token=None,
-            access_token=None,
-            access_token_expiry=None,
-            no_cache=False
+            proxies=None,
+            no_cache=False,
+            *args, **kwargs
     ):
 
         self.session = requests.Session()
-        self.session.cookies = LWPCookieJar()
-        if not os.path.exists(COOKIE_FILE):
-            self.session.cookies.save(COOKIE_FILE)
-        self.session.cookies.load(COOKIE_FILE, ignore_discard=True)
+        self.cookies = LWPCookieJar()
+        if not os.path.exists(self.COOKIES_FILE):
+            self.cookies.save(self.COOKIES_FILE)
+        self.cookies.load(self.COOKIES_FILE, ignore_discard=True)
         self.session.headers = self.HEADERS
         self._state = AttrDict([
             ("username", username),
             ("password", password),
-            ("api_key", api_key),
-            ("client_api_key", client_api_key),
-            ("token", token),
-            ("access_token", access_token),
-            ("access_token_expiry", access_token_expiry)
+            ("proxies", proxies)
         ])
         self.no_cache = no_cache
         self._cache_responses = False
@@ -118,21 +100,88 @@ class MLBSession(object):
                                     detect_types = sqlite3.PARSE_DECLTYPES)
         self.cursor = self.conn.cursor()
         self.cache_purge()
+        # if not self.logged_in:
         self.login()
+        # logger.debug("already logged in")
+            # return
+
+
+
+    @classmethod
+    def session_type(cls):
+        return cls.__name__.replace("StreamSession", "").lower()
+
+    @classmethod
+    def _COOKIES_FILE(cls):
+        return os.path.join(config.CONFIG_DIR, f"{cls.session_type()}.cookies")
+
+    @property
+    def COOKIES_FILE(self):
+        return self._COOKIES_FILE()
+
+    @classmethod
+    def _SESSION_FILE(cls):
+        return os.path.join(config.CONFIG_DIR, f"{cls.session_type()}.session")
+
+    @property
+    def SESSION_FILE(self):
+        return self._SESSION_FILE()
+
+    @classmethod
+    def new(cls, **kwargs):
+        try:
+            return cls.load(**kwargs)
+        except FileNotFoundError:
+            logger.trace(f"creating new session: {kwargs}")
+            provider = config.settings.profile.providers.get(cls.session_type())
+            return cls(username=provider.username,
+                       password=provider.password,
+                       **kwargs)
+
+    @property
+    def cookies(self):
+        return self.session.cookies
+
+    @cookies.setter
+    def cookies(self, value):
+        self.session.cookies = value
+
+    @classmethod
+    def destroy(cls):
+        if os.path.exists(cls.COOKIES_FILE):
+            os.remove(cls.COOKIES_FILE)
+        if os.path.exists(cls.SESSION_FILE):
+            os.remove(cls.SESSION_FILE)
+
+    @classmethod
+    def load(cls, *args, **kwargs):
+        state = yaml.load(open(cls._SESSION_FILE()), Loader=AttrDictYAMLLoader)
+        logger.trace(f"load: {cls.__name__}, {state}")
+        return cls(**state)
+
+    def save(self):
+        logger.trace(f"load: {self.__class__.__name__}, {self._state}")
+        with open(self.SESSION_FILE, 'w') as outfile:
+            yaml.dump(self._state, outfile, default_flow_style=False)
+        self.cookies.save(self.COOKIES_FILE)
+
+
+    def get_cookie(self, name):
+        return requests.utils.dict_from_cookiejar(self.cookies).get(name)
 
     def __getattr__(self, attr):
         if attr in ["delete", "get", "head", "options", "post", "put", "patch"]:
             # return getattr(self.session, attr)
             session_method = getattr(self.session, attr)
             return functools.partial(self.request, session_method)
-        # raise AttributeError(attr)
+        raise AttributeError(attr)
 
     def request(self, method, url, *args, **kwargs):
 
         response = None
         use_cache = not self.no_cache and self._cache_responses
         if use_cache:
-            logger.debug("getting cached response for %s" %(url))
+            logger.debug("getting cached response fsesor %s" %(url))
             self.cursor.execute(
                 "SELECT response, last_seen "
                 "FROM response_cache "
@@ -150,9 +199,9 @@ class MLBSession(object):
             except TypeError:
                 logger.debug("no cached response for %s" %(url))
 
-        if not response:
-            response = method(url, *args, **kwargs)
-
+        # if not response:
+        #     response = method(url, *args, **kwargs)
+        #     logger.trace(dump.dump_all(response).decode("utf-8"))
         if use_cache:
             pickled_response = pickle.dumps(response)
             sql="""INSERT OR REPLACE
@@ -174,31 +223,22 @@ class MLBSession(object):
     def password(self):
         return self._state.password
 
-    @classmethod
-    def new(cls, **kwargs):
-        try:
-            return cls.load()
-        except:
-            return cls(username=config.settings.username,
-                       password=config.settings.password,
-                       **kwargs)
+    @property
+    def proxies(self):
+        return self._state.proxies
 
-    @classmethod
-    def destroy(cls):
-        if os.path.exists(COOKIE_FILE):
-            os.remove(COOKIE_FILE)
-        if os.path.exists(SESSION_FILE):
-            os.remove(SESSION_FILE)
+    @property
+    def headers(self):
+        return []
 
-    @classmethod
-    def load(cls):
-        state = yaml.load(open(SESSION_FILE), Loader=AttrDictYAMLLoader)
-        return cls(**state)
+    @proxies.setter
+    def proxies(self, value):
+        # Override proxy environment variables if proxies are defined on session
+        if value is not None:
+            self.session.trust_env = (len(value) == 0)
+        self._state.proxies = value
+        self.session.proxies.update(value)
 
-    def save(self):
-        with open(SESSION_FILE, 'w') as outfile:
-            yaml.dump(self._state, outfile, default_flow_style=False)
-        self.session.cookies.save(COOKIE_FILE)
 
     @contextmanager
     def cache_responses(self, duration=CACHE_DURATION_DEFAULT):
@@ -238,58 +278,196 @@ class MLBSession(object):
             "WHERE last_seen < datetime('now', '-%d days')" %(days)
         )
 
+class BAMStreamSessionMixin(object):
+    """
+    StreamSession subclass for BAMTech Media stream providers, which currently
+    includes MLB.tv and NHL.tv
+    """
+    sport_id = 1 # FIXME
+
+    @memo(region="short")
+    def schedule(
+            self,
+            # sport_id=None,
+            start=None,
+            end=None,
+            game_type=None,
+            team_id=None,
+            game_id=None,
+    ):
+
+        logger.debug(
+            "getting schedule: %s, %s, %s, %s, %s, %s" %(
+                self.sport_id,
+                start,
+                end,
+                game_type,
+                team_id,
+                game_id
+            )
+        )
+        url = self.SCHEDULE_TEMPLATE.format(
+            sport_id = self.sport_id,
+            start = start.strftime("%Y-%m-%d") if start else "",
+            end = end.strftime("%Y-%m-%d") if end else "",
+            game_type = game_type if game_type else "",
+            team_id = team_id if team_id else "",
+            game_id = game_id if game_id else ""
+        )
+        with self.cache_responses_short():
+            return self.session.get(url).json()
+
+    @memo(region="short")
+    def get_epgs(self, game_id, title=None):
+
+        schedule = self.schedule(game_id=game_id)
+        try:
+            # Get last date for games that have been rescheduled to a later date
+            game = schedule["dates"][-1]["games"][0]
+        except KeyError:
+            logger.debug("no game data")
+            return
+        epgs = game["content"]["media"]["epg"]
+
+        if not isinstance(epgs, list):
+            epgs = [epgs]
+
+        return [ e for e in epgs if (not title) or title == e["title"] ]
+
+    def get_media(self,
+                  game_id,
+                  media_id=None,
+                  title=None,
+                  preferred_stream=None,
+                  call_letters=None):
+
+        logger.debug(f"geting media for game {game_id} ({media_id}, {title}, {call_letters})")
+
+        epgs = self.get_epgs(game_id, title)
+        for epg in epgs:
+            for item in epg["items"]:
+                if (not preferred_stream
+                    or (item.get("mediaFeedType", "").lower() == preferred_stream)
+                ) and (
+                    not call_letters
+                    or (item.get("callLetters", "").lower() == call_letters)
+                ) and (
+                    not media_id
+                    or (item.get("mediaId", "").lower() == media_id)
+                ):
+                    logger.debug("found preferred stream")
+                    yield Media(item)
+            else:
+                if len(epg["items"]):
+                    logger.debug("using non-preferred stream")
+                    yield Media(epg["items"][0])
+        # raise StopIteration
+
+
+
+class MLBStreamSession(BAMStreamSessionMixin, StreamSession):
+
+    SCHEDULE_TEMPLATE = (
+        "http://statsapi.mlb.com/api/v1/schedule"
+        "?sportId={sport_id}&startDate={start}&endDate={end}"
+        "&gameType={game_type}&gamePk={game_id}"
+        "&teamId={team_id}"
+        "&hydrate=linescore,team,game(content(summary,media(epg)),tickets)"
+    )
+
+    PLATFORM = "macintosh"
+
+    BAM_SDK_VERSION = "3.4"
+
+    MLB_API_KEY_URL = "https://www.mlb.com/tv/g490865/"
+
+    API_KEY_RE = re.compile(r'"apiKey":"([^"]+)"')
+
+    CLIENT_API_KEY_RE = re.compile(r'"clientApiKey":"([^"]+)"')
+
+    OKTA_CLIENT_ID_RE = re.compile("""production:{clientId:"([^"]+)",""")
+
+    MLB_OKTA_URL = "https://www.mlbstatic.com/mlb.com/vendor/mlb-okta/mlb-okta.js"
+
+    AUTHN_URL = "https://ids.mlb.com/api/v1/authn"
+
+    AUTHZ_URL = "https://ids.mlb.com/oauth2/aus1m088yK07noBfh356/v1/authorize"
+
+    BAM_DEVICES_URL = "https://us.edge.bamgrid.com/devices"
+
+    BAM_SESSION_URL = "https://us.edge.bamgrid.com/session"
+
+    BAM_TOKEN_URL = "https://us.edge.bamgrid.com/token"
+
+    BAM_ENTITLEMENT_URL = "https://media-entitlement.mlb.com/api/v3/jwt"
+
+    GAME_CONTENT_URL_TEMPLATE="http://statsapi.mlb.com/api/v1/game/{game_id}/content"
+
+    STREAM_URL_TEMPLATE="https://edge.svcs.mlb.com/media/{media_id}/scenarios/browser~csai"
+
+    AIRINGS_URL_TEMPLATE=(
+        "https://search-api-mlbtv.mlb.com/svc/search/v2/graphql/persisted/query/"
+        "core/Airings?variables={{%22partnerProgramIds%22%3A[%22{game_id}%22]}}"
+    )
+
+    RESOLUTIONS = AttrDict([
+        ("720p", "720p_alt"),
+        ("720p@30", "720p"),
+        ("540p", "540p"),
+        ("504p", "504p"),
+        ("360p", "360p"),
+        ("288p", "288p"),
+        ("224p", "224p")
+    ])
+
+    def __init__(
+            self,
+            username, password,
+            api_key=None,
+            client_api_key=None,
+            okta_client_id=None,
+            session_token=None,
+            access_token=None,
+            access_token_expiry=None,
+            *args, **kwargs
+    ):
+        super(MLBStreamSession, self).__init__(
+            username, password,
+            *args, **kwargs
+        )
+        self._state.api_key = api_key
+        self._state.client_api_key = client_api_key
+        self._state.okta_client_id = okta_client_id
+        self._state.session_token = session_token
+        self._state.access_token = access_token
+        self._state.access_token_expiry = access_token_expiry
+
+
     def login(self):
 
-        logger.debug("checking for existing log in")
-
-        initial_url = ("https://secure.mlb.com/enterworkflow.do"
-                       "?flowId=registration.wizard&c_id=mlb")
-
-        # res = self.get(initial_url)
-        # if not res.status_code == 200:
-        #     raise MLBSessionException(res.content)
-
-        data = {
-            "uri": "/account/login_register.jsp",
-            "registrationAction": "identify",
-            "emailAddress": self.username,
+        AUTHN_PARAMS = {
+            "username": self.username,
             "password": self.password,
-            "submitButton": ""
+            "options": {
+                "multiOptionalFactorEnroll": False,
+                "warnBeforePasswordExpired": True
+            }
         }
-        if self.logged_in:
-            logger.debug("already logged in")
-            return
+        authn_response = self.session.post(
+            self.AUTHN_URL, json=AUTHN_PARAMS
+        ).json()
+        self.session_token = authn_response["sessionToken"]
 
-        logger.debug("attempting new log in")
-
-        login_url = "https://securea.mlb.com/authenticate.do"
-
-        res = self.post(
-            login_url,
-            data=data,
-            headers={"Referer": (initial_url)}
-        )
-
-        if not (self.ipid and self.fingerprint):
-            raise MLBSessionException("Couldn't get ipid / fingerprint")
-
-        logger.debug("logged in: %s" %(self.ipid))
+        # logger.debug("logged in: %s" %(self.ipid))
         self.save()
 
     @property
-    def logged_in(self):
+    def headers(self):
 
-        logged_in_url = ("https://web-secure.mlb.com/enterworkflow.do"
-                         "?flowId=registration.newsletter&c_id=mlb")
-        content = self.get(logged_in_url).text
-        parser = lxml.etree.HTMLParser()
-        data = lxml.etree.parse(StringIO(content), parser)
-        if "Login/Register" in data.xpath(".//title")[0].text:
-            return False
+        return {
+            "Authorization": self.access_token
+        }
 
-
-    def get_cookie(self, name):
-        return requests.utils.dict_from_cookiejar(self.session.cookies).get(name)
 
     @property
     def ipid(self):
@@ -313,39 +491,43 @@ class MLBSession(object):
             self.update_api_keys()
         return self._state.client_api_key
 
+    @property
+    def okta_client_id(self):
+
+        if not self._state.get("okta_client_id"):
+            self.update_api_keys()
+        return self._state.okta_client_id
+
     def update_api_keys(self):
 
-        logger.debug("updating api keys")
-        content = self.get("https://www.mlb.com/tv/g490865/").text
+        logger.debug("updating MLB api keys")
+        content = self.session.get(self.MLB_API_KEY_URL).text
         parser = lxml.etree.HTMLParser()
         data = lxml.etree.parse(StringIO(content), parser)
 
         scripts = data.xpath(".//script")
         for script in scripts:
             if script.text and "apiKey" in script.text:
-                self._state.api_key = API_KEY_RE.search(script.text).groups()[0]
+                self._state.api_key = self.API_KEY_RE.search(script.text).groups()[0]
             if script.text and "clientApiKey" in script.text:
-                self._state.client_api_key = CLIENT_API_KEY_RE.search(script.text).groups()[0]
+                self._state.client_api_key = self.CLIENT_API_KEY_RE.search(script.text).groups()[0]
+
+        logger.debug("updating Okta api keys")
+        content = self.session.get(self.MLB_OKTA_URL).text
+        self._state.okta_client_id = self.OKTA_CLIENT_ID_RE.search(content).groups()[0]
         self.save()
 
     @property
-    def token(self):
-        logger.debug("getting token")
-        if not self._state.token:
-            headers = {"x-api-key": self.api_key}
+    def session_token(self):
+        if not self._state.session_token:
+            self.login()
+        if not self._state.session_token:
+            raise Exception("no session token")
+        return self._state.session_token
 
-            response = self.get(
-                TOKEN_URL_TEMPLATE.format(
-                    ipid=self.ipid, fingerprint=self.fingerprint, platform=PLATFORM
-                ),
-                headers=headers
-            )
-            self._state.token = response.text
-        return self._state.token
-
-    @token.setter
-    def token(self, value):
-        self._state.token = value
+    @session_token.setter
+    def session_token(self, value):
+        self._state.session_token = value
 
     @property
     def access_token_expiry(self):
@@ -360,139 +542,215 @@ class MLBSession(object):
 
     @property
     def access_token(self):
-        logger.debug("getting access token")
         if not self._state.access_token or not self.access_token_expiry or \
                 self.access_token_expiry < datetime.now(tz=pytz.UTC):
-
             try:
-                self._state.access_token, self.access_token_expiry = self._get_access_token()
+                self.refresh_access_token()
             except requests.exceptions.HTTPError:
                 # Clear token and then try to get a new access_token
-                self.token = None
-                self._state.access_token, self.access_token_expiry = self._get_access_token()
+                self.refresh_access_token(clear_token=True)
 
-        self.save()
         logger.debug("access_token: %s" %(self._state.access_token))
         return self._state.access_token
 
-    def _get_access_token(self):
+    def refresh_access_token(self, clear_token=False):
+        logger.debug("refreshing access token")
+
+        if clear_token:
+            self.session_token = None
+
+        # ----------------------------------------------------------------------
+        # Okta authentication -- used to get media entitlement later
+        # ----------------------------------------------------------------------
+        STATE = gen_random_string(64)
+        NONCE = gen_random_string(64)
+
+        AUTHZ_PARAMS = {
+            "client_id": self.okta_client_id,
+            "redirect_uri": "https://www.mlb.com/login",
+            "response_type": "id_token token",
+            "response_mode": "okta_post_message",
+            "state": STATE,
+            "nonce": NONCE,
+            "prompt": "none",
+            "sessionToken": self.session_token,
+            "scope": "openid email"
+        }
+        authz_response = self.session.get(self.AUTHZ_URL, params=AUTHZ_PARAMS)
+        authz_content = authz_response.text
+
+        for line in authz_content.split("\n"):
+            if "data.access_token" in line:
+                OKTA_ACCESS_TOKEN = line.split("'")[1].encode('utf-8').decode('unicode_escape')
+                break
+        else:
+            raise Exception(authz_content)
+
+        # ----------------------------------------------------------------------
+        # Get device assertion - used to get device token
+        # ----------------------------------------------------------------------
+        DEVICES_HEADERS = {
+            "Authorization": "Bearer %s" % (self.client_api_key),
+            "Origin": "https://www.mlb.com",
+        }
+
+        DEVICES_PARAMS = {
+            "applicationRuntime": "firefox",
+            "attributes": {},
+            "deviceFamily": "browser",
+            "deviceProfile": "macosx"
+        }
+
+        devices_response = self.session.post(
+            self.BAM_DEVICES_URL,
+            headers=DEVICES_HEADERS, json=DEVICES_PARAMS
+        ).json()
+
+        DEVICES_ASSERTION=devices_response["assertion"]
+
+        # ----------------------------------------------------------------------
+        # Get device token
+        # ----------------------------------------------------------------------
+
+        TOKEN_PARAMS = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "latitude": "0",
+            "longitude": "0",
+            "platform": "browser",
+            "subject_token": DEVICES_ASSERTION,
+            "subject_token_type": "urn:bamtech:params:oauth:token-type:device"
+        }
+        token_response = self.session.post(
+            self.BAM_TOKEN_URL, headers=DEVICES_HEADERS, data=TOKEN_PARAMS
+        ).json()
+
+
+        DEVICE_ACCESS_TOKEN = token_response["access_token"]
+        DEVICE_REFRESH_TOKEN = token_response["refresh_token"]
+
+        # ----------------------------------------------------------------------
+        # Create session -- needed for device ID, which is used for entitlement
+        # ----------------------------------------------------------------------
+        SESSION_HEADERS = {
+            "Authorization": DEVICE_ACCESS_TOKEN,
+            "User-agent": USER_AGENT,
+            "Origin": "https://www.mlb.com",
+            "Accept": "application/vnd.session-service+json; version=1",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": "en-US,en;q=0.5",
+            "x-bamsdk-version": self.BAM_SDK_VERSION,
+            "x-bamsdk-platform": self.PLATFORM,
+            "Content-type": "application/json",
+            "TE": "Trailers"
+        }
+        session_response = self.session.get(
+            self.BAM_SESSION_URL,
+            headers=SESSION_HEADERS
+        ).json()
+        DEVICE_ID = session_response["device"]["id"]
+
+        # ----------------------------------------------------------------------
+        # Get entitlement token
+        # ----------------------------------------------------------------------
+        ENTITLEMENT_PARAMS={
+            "os": self.PLATFORM,
+            "did": DEVICE_ID,
+            "appname": "mlbtv_web"
+        }
+
+        ENTITLEMENT_HEADERS = {
+            "Authorization": "Bearer %s" % (OKTA_ACCESS_TOKEN),
+            "Origin": "https://www.mlb.com",
+            "x-api-key": self.api_key
+
+        }
+        entitlement_response = self.session.get(
+            self.BAM_ENTITLEMENT_URL,
+            headers=ENTITLEMENT_HEADERS,
+            params=ENTITLEMENT_PARAMS
+        )
+
+        ENTITLEMENT_TOKEN = entitlement_response.content
+
+        # ----------------------------------------------------------------------
+        # Finally (whew!) get access token using entitlement token
+        # ----------------------------------------------------------------------
         headers = {
             "Authorization": "Bearer %s" % (self.client_api_key),
             "User-agent": USER_AGENT,
             "Accept": "application/vnd.media-service+json; version=1",
-            "x-bamsdk-version": BAM_SDK_VERSION,
-            "x-bamsdk-platform": PLATFORM,
+            "x-bamsdk-version": self.BAM_SDK_VERSION,
+            "x-bamsdk-platform": self.PLATFORM,
             "origin": "https://www.mlb.com"
         }
         data = {
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "platform": "browser",
-            "setCookie": "false",
-            "subject_token": self.token,
-            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt"
+            "subject_token": ENTITLEMENT_TOKEN,
+            "subject_token_type": "urn:bamtech:params:oauth:token-type:account"
         }
-        response = self.post(
-            ACCESS_TOKEN_URL,
+        response = self.session.post(
+            self.BAM_TOKEN_URL,
             data=data,
             headers=headers
         )
+        # from requests_toolbelt.utils import dump
+        # print(dump.dump_all(response).decode("utf-8"))
         response.raise_for_status()
         token_response = response.json()
 
-        token_expiry = datetime.now(tz=pytz.UTC) + \
+        self.access_token_expiry = datetime.now(tz=pytz.UTC) + \
                        timedelta(seconds=token_response["expires_in"])
-
-        return token_response["access_token"], token_expiry
+        self._state.access_token = token_response["access_token"]
+        self.save()
 
     def content(self, game_id):
 
-        return self.get(GAME_CONTENT_URL_TEMPLATE.format(game_id=game_id)).json()
+        return self.session.get(
+            self.GAME_CONTENT_URL_TEMPLATE.format(game_id=game_id)).json()
 
     # def feed(self, game_id):
 
-    #     return self.get(GAME_FEED_URL.format(game_id=game_id)).json()
+    #     return self.session.get(GAME_FEED_URL.format(game_id=game_id)).json()
 
-    @memo(region="short")
-    def schedule(
-            self,
-            sport_id=None,
-            start=None,
-            end=None,
-            game_type=None,
-            team_id=None,
-            game_id=None,
-    ):
+    @memo(region="long")
+    def teams(self, sport_code="mlb", season=None):
 
-        logger.debug(
-            "getting schedule: %s, %s, %s, %s, %s, %s" %(
-                sport_id,
-                start,
-                end,
-                game_type,
-                team_id,
-                game_id
+        if sport_code != "mlb":
+            media_title = "MiLBTV"
+            raise MLBPlayException("Sorry, MiLB.tv streams are not yet supported")
+
+        sports_url = (
+            "http://statsapi.mlb.com/api/v1/sports"
+        )
+        with state.session.cache_responses_long():
+            sports = self.session.get(sports_url).json()
+
+        sport = next(s for s in sports["sports"] if s["code"] == sport_code)
+
+        # season = game_date.year
+        teams_url = (
+            "http://statsapi.mlb.com/api/v1/teams"
+            "?sportId={sport}&{season}".format(
+                sport=sport["id"],
+                season=season if season else ""
             )
         )
-        url = SCHEDULE_TEMPLATE.format(
-            sport_id = sport_id if sport_id else "",
-            start = start.strftime("%Y-%m-%d") if start else "",
-            end = end.strftime("%Y-%m-%d") if end else "",
-            game_type = game_type if game_type else "",
-            team_id = team_id if team_id else "",
-            game_id = game_id if game_id else ""
-        )
-        with self.cache_responses_short():
-            return self.get(url).json()
 
-    @memo(region="short")
-    def get_epgs(self, game_id, title="MLBTV"):
-        schedule = self.schedule(game_id=game_id)
-        try:
-            # Get last date for games that have been rescheduled to a later date
-            game = schedule["dates"][-1]["games"][0]
-        except KeyError:
-            logger.debug("no game data")
-            return
-        epgs = game["content"]["media"]["epg"]
+        # raise Exception(self.session.get(teams_url).json())
+        with state.session.cache_responses_long():
+            teams = AttrDict(
+                (team["abbreviation"].lower(), team["id"])
+                for team in sorted(self.session.get(teams_url).json()["teams"],
+                                   key=lambda t: t["fileCode"])
+            )
 
-        if not isinstance(epgs, list):
-            epgs = [epgs]
-
-        return [ e for e in epgs if (not title) or title == e["title"] ]
-
-    def get_media(self,
-                  game_id,
-                  media_id=None,
-                  title="MLBTV",
-                  preferred_stream=None,
-                  call_letters=None):
-
-        logger.debug("geting media for game %d" %(game_id))
-
-        epgs = self.get_epgs(game_id, title)
-        for epg in epgs:
-            for item in epg["items"]:
-                if (not preferred_stream
-                    or (item.get("mediaFeedType", "").lower() == preferred_stream)
-                ) and (
-                    not call_letters
-                    or (item.get("callLetters", "").lower() == call_letters)
-                ) and (
-                    not media_id
-                    or (item.get("mediaId", "").lower() == media_id)
-                ):
-                    logger.debug("found preferred stream")
-                    yield item
-            else:
-                if len(epg["items"]):
-                    logger.debug("using non-preferred stream")
-                    yield epg["items"][0]
-        # raise StopIteration
+        return teams
 
     def airings(self, game_id):
 
-        airings_url = AIRINGS_URL_TEMPLATE.format(game_id = game_id)
-        airings = self.get(
+        airings_url = self.AIRINGS_URL_TEMPLATE.format(game_id = game_id)
+        airings = self.session.get(
             airings_url
         ).json()["data"]["Airings"]
         return airings
@@ -504,7 +762,7 @@ class MLBSession(object):
             airing = next(a for a in self.airings(game_id)
                           if a["mediaId"] == media_id)
         except StopIteration:
-            raise MLBSessionException("No airing for media %s" %(media_id))
+            raise StreamSessionException("No airing for media %s" %(media_id))
 
         start_timestamps = []
         try:
@@ -568,32 +826,270 @@ class MLBSession(object):
         ]))
         return timestamps
 
-    def get_stream(self, media_id):
+    def get_stream(self, media):
 
-        # try:
-        #     media = next(self.get_media(game_id))
-        # except StopIteration:
-        #     logger.debug("no media for stream")
-        #     return
-        # media_id = media["mediaId"]
+        media_id = media.get("mediaId", media.get("guid"))
 
         headers={
             "Authorization": self.access_token,
             "User-agent": USER_AGENT,
             "Accept": "application/vnd.media-service+json; version=1",
             "x-bamsdk-version": "3.0",
-            "x-bamsdk-platform": PLATFORM,
+            "x-bamsdk-platform": self.PLATFORM,
             "origin": "https://www.mlb.com"
         }
-        stream_url = STREAM_URL_TEMPLATE.format(media_id=media_id)
+        stream_url = self.STREAM_URL_TEMPLATE.format(media_id=media_id)
         logger.info("getting stream %s" %(stream_url))
-        stream = self.get(
+        stream = self.session.get(
             stream_url,
             headers=headers
         ).json()
         logger.debug("stream response: %s" %(stream))
         if "errors" in stream and len(stream["errors"]):
             return None
+        stream = Stream(stream)
+        stream.url = stream["stream"]["complete"]
         return stream
 
-__all__ = ["MLBSession", "MLBSessionException"]
+
+
+class NHLStreamSession(BAMStreamSessionMixin, StreamSession):
+
+    AUTH = b"web_nhl-v1.0.0:2d1d846ea3b194a18ef40ac9fbce97e3"
+
+    SCHEDULE_TEMPLATE = (
+        "https://statsapi.web.nhl.com/api/v1/schedule"
+        "?sportId={sport_id}&startDate={start}&endDate={end}"
+        "&gameType={game_type}&gamePk={game_id}"
+        "&teamId={team_id}"
+        "&hydrate=linescore,team,game(content(summary,media(epg)),tickets)"
+    )
+
+    RESOLUTIONS = AttrDict([
+        ("720p", "720p"),
+        ("540p", "540p"),
+        ("504p", "504p"),
+        ("360p", "360p"),
+        ("288p", "288p"),
+        ("216p", "216p")
+    ])
+
+    def __init__(
+            self,
+            username, password,
+            session_key=None,
+            *args, **kwargs
+    ):
+        super(NHLStreamSession, self).__init__(
+            username, password,
+            *args, **kwargs
+        )
+        self.session_key = session_key
+
+
+    def login(self):
+
+        if self.logged_in:
+            logger.info("already logged in")
+            return
+
+        auth = base64.b64encode(self.AUTH).decode("utf-8")
+
+        token_url = "https://user.svc.nhl.com/oauth/token?grant_type=client_credentials"
+
+        headers = {
+            "Authorization": f"Basic {auth}",
+            # "Referer": "https://www.nhl.com/login/freeGame?forwardUrl=https%3A%2F%2Fwww.nhl.com%2Ftv%2F2018020013%2F221-2000552%2F61332703",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Origin": "https://www.nhl.com"
+        }
+
+        res = self.session.post(token_url, headers=headers)
+        self.session_token = json.loads(res.text)["access_token"]
+
+        login_url="https://gateway.web.nhl.com/ws/subscription/flow/nhlPurchase.login"
+
+        auth = base64.b64encode(b"web_nhl-v1.0.0:2d1d846ea3b194a18ef40ac9fbce97e3")
+
+        params = {
+            "nhlCredentials":  {
+                "email": self.username,
+                "password": self.password
+            }
+        }
+
+        headers = {
+            "Authorization": self.session_token,
+            "Origin": "https://www.nhl.com",
+            # "Referer": "https://www.nhl.com/login/freeGame?forwardUrl=https%3A%2F%2Fwww.nhl.com%2Ftv%2F2018020013%2F221-2000552%2F61332703",
+        }
+
+        res = self.session.post(
+            login_url,
+            json=params,
+            headers=headers
+        )
+        self.save()
+        print(res.status_code)
+        return (res.status_code == 200)
+
+
+    @property
+    def logged_in(self):
+
+        logged_in_url = "https://account.nhl.com/ui/AccountProfile"
+        content = self.session.get(logged_in_url).text
+        # FIXME: this is gross
+        if '"NHL Account - Profile"' in content:
+            return True
+        return False
+
+    @property
+    def session_key(self):
+        return self._state.session_key
+
+    @session_key.setter
+    def session_key(self, value):
+        self._state.session_key = value
+
+    @property
+    def token(self):
+        return self._state.token
+
+    @token.setter
+    def token(self, value):
+        self._state.token = value
+
+
+    @memo(region="long")
+    def teams(self, sport_code="mlb", season=None):
+
+        teams_url = (
+            "https://statsapi.web.nhl.com/api/v1/teams"
+            "?{season}".format(
+                season=season if season else ""
+            )
+        )
+
+        # raise Exception(self.session.get(teams_url).json())
+        with state.session.cache_responses_long():
+            teams = AttrDict(
+                (team["abbreviation"].lower(), team["id"])
+                for team in sorted(self.session.get(teams_url).json()["teams"],
+                                   key=lambda t: t["abbreviation"])
+            )
+
+        return teams
+
+
+    def get_stream(self, media):
+
+        url = "https://mf.svc.nhl.com/ws/media/mf/v2.4/stream"
+
+        event_id = media["eventId"]
+        if not self.session_key:
+            logger.info("getting session key")
+
+
+            params = {
+                "eventId": event_id,
+                "format": "json",
+                "platform": "WEB_MEDIAPLAYER",
+                "subject": "NHLTV",
+                "_": "1538708097285"
+            }
+
+            res = self.session.get(
+                url,
+                params=params
+            )
+            j = res.json()
+            logger.trace(json.dumps(j, sort_keys=True,
+                             indent=4, separators=(',', ': ')))
+
+            self.session_key = j["session_key"]
+            self.save()
+
+        params = {
+            "contentId": media["mediaPlaybackId"],
+            "playbackScenario": "HTTP_CLOUD_WIRED_WEB",
+            "sessionKey": self.session_key,
+            "auth": "response",
+            "platform": "WEB_MEDIAPLAYER",
+            "_": "1538708097285"
+        }
+        res = self.session.get(
+            url,
+            params=params
+        )
+        j = res.json()
+        logger.trace(json.dumps(j, sort_keys=True,
+                                   indent=4, separators=(',', ': ')))
+
+        try:
+            media_auth = next(x["attributeValue"]
+                              for x in j["session_info"]["sessionAttributes"]
+                              if x["attributeName"] == "mediaAuth_v2")
+        except KeyError:
+            raise StreamSessionException(f"No stream found for event {event_id}")
+
+        self.cookies.set_cookie(
+            Cookie(0, 'mediaAuth_v2', media_auth,
+                   '80', '80', '.nhl.com',
+                   None, None, '/', True, False, 4102444800, None, None, None, {}),
+        )
+
+        stream = Stream(j["user_verified_event"][0]["user_verified_content"][0]["user_verified_media_item"][0])
+
+        return stream
+
+
+def new(provider, *args, **kwargs):
+    session_class = globals().get(f"{provider.upper()}StreamSession")
+    return session_class.new(*args, **kwargs)
+
+PROVIDERS_RE = re.compile(r"(.+)StreamSession$")
+PROVIDERS = [ k.replace("StreamSession", "").lower()
+              for k in globals() if PROVIDERS_RE.search(k) ]
+
+
+def main():
+
+    from . import state
+    from . import utils
+    import argparse
+
+    global options
+
+    parser = argparse.ArgumentParser()
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-v", "--verbose", action="count", default=0,
+                        help="verbose logging")
+    group.add_argument("-q", "--quiet", action="count", default=0,
+                        help="quiet logging")
+    options, args = parser.parse_known_args()
+
+    utils.setup_logging(options.verbose - options.quiet)
+
+    # state.session = MLBStreamSession.new()
+    # raise Exception(state.session.token)
+    raise Exception(PROVIDERS)
+
+    # state.session = NHLStreamSession.new()
+    # raise Exception(state.session.session_key)
+
+
+    # schedule = state.session.schedule(game_id=2018020020)
+    # media = self.session.get_epgs(game_id=2018020020)
+    # print(json.dumps(list(media), sort_keys=True,
+    #                  indent=4, separators=(',', ': ')))
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+__all__ = ["MLBStreamSession", "StreamSessionException"]

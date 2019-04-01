@@ -7,7 +7,8 @@ try:
 except ImportError:
     from collections import MutableMapping
 import yaml
-from orderedattrdict import AttrDict
+import functools
+from orderedattrdict import Tree
 import orderedattrdict.yamlutils
 from orderedattrdict.yamlutils import AttrDictYAMLLoader
 import distutils.spawn
@@ -18,7 +19,6 @@ from prompt_toolkit.validation import Validator, ValidationError
 from prompt_toolkit.shortcuts import confirm
 from prompt_toolkit.shortcuts import prompt
 import getpass
-from .util import *
 
 CONFIG_DIR=os.path.expanduser("~/.config/mlbstreamer")
 CONFIG_FILE=os.path.join(CONFIG_DIR, "config.yaml")
@@ -68,17 +68,70 @@ class RangeNumberValidator(Validator):
                 message="Value must be less than %s" %(self.maximum)
             )
 
+class ProfileTree(Tree):
 
-class Config(MutableMapping):
+    DEFAULT_PROFILE_NAME = "default"
 
-    def __init__(self, config_file):
+    def __init__(self, profile=DEFAULT_PROFILE_NAME, *args, **kwargs):
+        super(ProfileTree, self).__init__(*args, **kwargs)
+        self.__exclude_keys__ |= {"_profile_name", "_default_profile_name", "profile"}
+        self._default_profile_name = profile
+        self.set_profile(self._default_profile_name)
 
-        self._config = None
+    @property
+    def profile(self):
+        return self[self._profile_name]
+
+    def set_profile(self, profile):
+        self._profile_name = profile
+
+    def __getattr__(self, name):
+        if not name.startswith("_"):
+            p = self.profile
+            return p.get(name) if name in p else self[self._default_profile_name].get(name)
+        raise AttributeError
+
+    def __setattr__(self, name, value):
+        if not name.startswith("_"):
+            self[self._profile_name][name] = value
+        else:
+            object.__setattr__(self, name, value)
+
+    def get(self, name, default=None):
+        p = self.profile
+        return p.get(name, default) if name in p else self[self._default_profile_name].get(name, default)
+
+    def __getitem__(self, name):
+        if isinstance(name, tuple):
+            return functools.reduce(
+                lambda a, b: AttrDict(a, **{ k: v for k, v in b.items() if k not in a}),
+                [ self[p] for p in reversed(name) ]
+            )
+
+        else:
+            return super(ProfileTree, self).__getitem__(name)
+
+class Config(Tree):
+
+    DEFAULT_PROFILE = "default"
+
+    def __init__(self, config_file, *args, **kwargs):
+        super(Config, self).__init__(*args, **kwargs)
+        self.__exclude_keys__ |= {"_config_file", "set_profile", "_profile_tree"}
         self._config_file = config_file
+        self.load()
+        self._profile_tree = ProfileTree(**self.profiles)
+
 
     def init_config(self):
 
-        from .session import MLBSession, MLBSessionException
+        raise Exception("""
+        Sorry, this configurator needs to be updated  to reflect recent changes
+        to the config file.  Until this is fixed, use the sample config found
+        in the "docs" directory of the distribution.
+        """)
+
+        from .session import StreamSession, StreamSessionException
 
         def mkdir_p(path):
             try:
@@ -93,27 +146,27 @@ class Config(MutableMapping):
                 if player:
                     yield player
 
-        MLBSession.destroy()
+        StreamSession.destroy()
         if os.path.exists(CONFIG_FILE):
             os.remove(CONFIG_FILE)
 
-        self._config = AttrDict()
         time_zone = None
         player = None
         mkdir_p(CONFIG_DIR)
 
         while True:
-            self.username = prompt(
+            self.profile.username = prompt(
                 "MLB.com username: ",
                 validator=NotEmptyValidator())
-            self.password =  prompt(
+            self.profile.password =  prompt(
                 'Enter password: ',
                 is_password=True, validator=NotEmptyValidator())
             try:
-                s = MLBSession(self.username, self.password)
+                s = StreamSession(self.profile.username,
+                               self.profile.password)
                 s.login()
                 break
-            except MLBSessionException:
+            except StreamSessionException:
                 print("Couldn't login to MLB, please check your credentials.")
                 continue
 
@@ -150,21 +203,21 @@ class Config(MutableMapping):
         if player_args:
             player = " ".join([player, player_args])
 
-        self.player = player
+        self.profile.player = player
 
-        print()
         print("\n".join(
             [ "\t%d: %s" %(n, l)
               for n, l in enumerate(
-                      MLB_HLS_RESOLUTION_MAP
+                      utils.MLB_HLS_RESOLUTION_MAP
               )]))
+        print("Select a default video resolution for MLB.tv streams:")
         choice = int(
             prompt(
-                "Select a default video resolution for MLB.tv streams",
-                validator=RangeNumberValidator(maximum=len(MLB_HLS_RESOLUTION_MAP))))
-        if choice:
-            self.default_resolution = MLB_HLS_RESOLUTION_MAP[
-                list(MLB_HLS_RESOLUTION_MAP.keys())[choice]
+                "Choice: ",
+                validator=RangeNumberValidator(maximum=len(utils.MLB_HLS_RESOLUTION_MAP))))
+        if choice is not None:
+            self.profile.default_resolution = utils.MLB_HLS_RESOLUTION_MAP[
+                list(utils.MLB_HLS_RESOLUTION_MAP.keys())[choice]
             ]
 
         print("Your system time zone seems to be %s." %(tz_local))
@@ -181,46 +234,31 @@ class Config(MutableMapping):
         else:
             time_zone = tz_local
 
-        self.time_zone = time_zone
+        self.profile.time_zone = time_zone
         self.save()
 
-    def load(self):
-        if not os.path.exists(self._config_file):
-            raise Exception("config file %s not found" %(CONFIG_FILE))
+    @property
+    def profile(self):
+        return self._profile_tree
 
-        config = yaml.load(open(self._config_file), Loader=AttrDictYAMLLoader)
-        if config.get("time_zone"):
-            config.tz = pytz.timezone(config.time_zone)
-        self._config = config
+    @property
+    def profiles(self):
+        return self._profile_tree
+
+    def set_profile(self, profile):
+        self._profile_tree.set_profile(profile)
+
+    def load(self):
+        if os.path.exists(self._config_file):
+            config = yaml.load(open(self._config_file), Loader=AttrDictYAMLLoader)
+            self.update(config.items())
 
     def save(self):
 
+        d = Tree([ (k, v) for k, v in self.items()])
+        d.update({"profiles": self._profile_tree})
         with open(self._config_file, 'w') as outfile:
-            yaml.dump(self._config, outfile, default_flow_style=False)
-
-    def __getattr__(self, name):
-        return self._config.get(name, None)
-
-    def __setattr__(self, name, value):
-
-        if not name.startswith("_"):
-            self._config[name] = value
-        object.__setattr__(self, name, value)
-
-    def __getitem__(self, key):
-        return self._config[key]
-
-    def __setitem__(self, key, value):
-        self._config[key] = value
-
-    def __delitem__(self, key):
-        del self._config[key]
-
-    def __len__(self):
-        return len(self._config)
-
-    def __iter__(self):
-        return iter(self._config)
+            yaml.dump(d, outfile, default_flow_style=False, indent=4)
 
 
 settings = Config(CONFIG_FILE)
@@ -230,3 +268,18 @@ __all__ = [
     "config",
     "settings"
 ]
+
+def main():
+    settings.set_profile("default")
+    print(settings.profile.default_resolution)
+    settings.set_profile("540p")
+    print(settings.profile.default_resolution)
+    print(settings.profile.get("env"))
+    print(settings.profiles["default"])
+    print(settings.profiles[("default")].get("env"))
+    print(settings.profiles[("default", "540p")].get("env"))
+    print(settings.profiles[("default", "540p")].get("env"))
+    print(settings.profiles[("default", "540p", "proxy")].get("env"))
+
+if __name__ == "__main__":
+    main()
